@@ -6,9 +6,13 @@
 from typing import Dict, List, Tuple, NamedTuple
 import numpy as np
 import pandas as pd
-from equilibrator_cache import Compound, CompoundMicrospecies, Q_, create_compound_cache_from_quilt
+from copy import copy
 
+from equilibrator_cache import Compound, CompoundMicrospecies, Q_
+from equilibrator_cache.api import create_compound_cache_from_sqlite_file
 from equilibrator_assets import chemaxon, thermodynamics
+
+from sqlalchemy import Column, Integer
 
 # The following modules were added
 # from component_contribution/scripts/support
@@ -19,12 +23,15 @@ from rdkit.Chem import AllChem
 
 LOG10 = np.log(10.0)
 
+# quilt_package = 'kevbot/cache_mod'
+# version = None
+sqlite_path = './cache/compounds.sqlite'
 group_decomposer = group_decompose.GroupDecomposer()
-ccache = create_compound_cache_from_quilt(package, version)
+ccache =  create_compound_cache_from_sqlite_file(sqlite_path)
 
 ###############################################################################
 # KMS Code
-def get_compound(mol_string: str):
+def get_compound(mol_string: str, update_cache: bool = True):
     """
     Gets a compound object from the compound cache, or generates one if not found.
 
@@ -44,12 +51,18 @@ def get_compound(mol_string: str):
 
     # First check to see if compound is in ccache through partial InChI key match
     inchi_key = AllChem.MolToInchiKey(mol)
+    print(inchi_key)
     cc_search = ccache.search_compound_by_inchi_key(inchi_key.split('-')[0])
 
     if cc_search:
         cpd = cc_search[0]
     else:
         cpd = gen_compound(mol_string)
+        # find next ID and add to sql database
+        if update_cache == True:
+            ccache.session.add(cpd)
+        cpd.id = -1
+        return cpd
 
     return cpd
 
@@ -98,7 +111,7 @@ def gen_compound(mol_string: str):
                     if pd.isnull(row.major_ms) or row.major_ms == "":
                         compound_mappings.append(
                             {
-                                "id": row.id,
+                                # "id": row.id,
                                 "atom_bag": {},
                                 "smiles": None,
                                 "dissociation_constants": dissociation_constants,
@@ -108,7 +121,7 @@ def gen_compound(mol_string: str):
                         atom_bag = chemaxon.get_atom_bag("smi", row.major_ms)
                         compound_mappings.append(
                             {
-                                "id": row.id,
+                                # "id": row.id,
                                 "atom_bag": atom_bag,
                                 "smiles": row.major_ms,
                                 "dissociation_constants": dissociation_constants,
@@ -119,21 +132,31 @@ def gen_compound(mol_string: str):
     cpd = Compound(**compound_mappings[0])    
 
     # Specify cpd information not specified in compound_mappings
-    cpd.major_ms = constants.iloc[0]['major_ms']
+    major_ms = constants.iloc[0]['major_ms']
+    mol = AllChem.MolFromSmiles(major_ms)
+    cpd.inchi = AllChem.MolToInchi(mol)
+    cpd.inchi_key = AllChem.MolToInchiKey(mol)
 
     # No magnesium data
     cpd.magnesium_dissociation_constants = []
 
     # Calculate microspecies and populate cpd with a list of CompoundMicrospecies generated with the microspecies dictionaries
-    _, microspecies = _get_microspecies_data(cpd.id, cpd.major_ms, cpd.dissociation_constants, cpd.atom_bag)
+    _, microspecies = _get_microspecies_data(cpd.id, major_ms, cpd.dissociation_constants, cpd.atom_bag)
     cpd.microspecies = [CompoundMicrospecies(**ind_ms) for ind_ms in microspecies]    
 
     # Decompose the compounds into the group vectors
-    mol = molecule.Molecule.FromSmiles(cpd.major_ms)
+    mol = molecule.Molecule.FromSmiles(major_ms)
     decomposition = group_decomposer.Decompose(mol, ignore_protonations=False, raise_exception=True)
     cpd.group_vector = decomposition.AsVector()
-    
+      
     return cpd
+
+def save_ccache():
+    ccache.session.commit()
+
+def _get_ccache():
+    # Returns the ccache for direct use
+    return ccache
 # End KMS Code
 ###############################################################################
 
