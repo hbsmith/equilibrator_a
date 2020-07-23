@@ -1,3 +1,11 @@
+# Ignore cache
 cache/
 cache/compounds.sqlite
 cache/README.md
+
+# ignore output logs
+foo.log
+mass_error.log
+
+# pycache
+__pycache__/

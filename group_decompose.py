@@ -305,6 +305,7 @@ class GroupDecomposer(object):
         Args:
             groups_data: a GroupsData object.
         """
+
         if groups_data is None:
             self.groups_data = DEFAULT_GROUPS_DATA
         else:
@@ -551,6 +552,7 @@ class GroupDecomposer(object):
 
         :return: A GroupDecomposition object containing the decomposition.
         """
+
         unassigned_nodes = set(range(len(mol)))
         groups: List[Tuple[Group, List[Set[int]]]] = []
 
@@ -624,5 +626,5 @@ class GroupDecomposer(object):
             raise GroupDecompositionError(
                 f"Unable to decompose {mol} into groups", decomposition
             )
-
+        
         return decomposition

@@ -7,12 +7,15 @@ from typing import Dict, List, Tuple, NamedTuple
 import numpy as np
 import pandas as pd
 from copy import copy
+from pathlib import Path
+import os
+
+import quilt
 
 from equilibrator_cache import Compound, CompoundMicrospecies, Q_
+from equilibrator_cache.compound_cache import PROTON_INCHI_KEY
 from equilibrator_cache.api import create_compound_cache_from_sqlite_file
 from equilibrator_assets import chemaxon, thermodynamics
-
-from sqlalchemy import Column, Integer
 
 # The following modules were added
 # from component_contribution/scripts/support
@@ -25,9 +28,19 @@ LOG10 = np.log(10.0)
 
 # quilt_package = 'kevbot/cache_mod'
 # version = None
-sqlite_path = './cache/compounds.sqlite'
+
 group_decomposer = group_decompose.GroupDecomposer()
-ccache =  create_compound_cache_from_sqlite_file(sqlite_path)
+
+# Path to sqlite databases
+# TODO: code that generates the data from elad's quilt if it doesn't exist
+sqlite_path = Path('./cache/compounds.sqlite')
+if not sqlite_path.is_file():
+    print('Local compounds.sqlite not found. Exporting from equilibrator/cache quilt package.')
+    os.mkdir('./cache')
+    quilt.export('equilibrator/cache', './cache')
+
+ccache = create_compound_cache_from_sqlite_file(sqlite_path)
+
 
 ###############################################################################
 # KMS Code
@@ -51,22 +64,34 @@ def get_compound(mol_string: str, update_cache: bool = True):
 
     # First check to see if compound is in ccache through partial InChI key match
     inchi_key = AllChem.MolToInchiKey(mol)
-    print(inchi_key)
     cc_search = ccache.search_compound_by_inchi_key(inchi_key.split('-')[0])
 
     if cc_search:
+        print('found match')
         cpd = cc_search[0]
     else:
-        cpd = gen_compound(mol_string)
+        cpd = _gen_compound(mol_string)
         # find next ID and add to sql database
         if update_cache == True:
+            # Stage the compound for addition to the sql
+            # an id will be automatically generated.
             ccache.session.add(cpd)
+            # Flush executes the command queued up by session.add
+            # however, this does not commit to the database, it is temporary.
+            ccache.session.flush()
+
+            # populate the microspecies and flush
+            # _populate_microspecies(ccache.session, cpd)
+            # ccache.session.flush()
+
+    # assign an id if one wasn't already
+    # need an id to calculate thermo
+    if not cpd.id:
         cpd.id = -1
-        return cpd
 
     return cpd
 
-def gen_compound(mol_string: str):
+def _gen_compound(mol_string: str):
     """
     Generate an equilibrator_cache Compound object directly from a SMILES or InChI. 
 
@@ -136,6 +161,8 @@ def gen_compound(mol_string: str):
     mol = AllChem.MolFromSmiles(major_ms)
     cpd.inchi = AllChem.MolToInchi(mol)
     cpd.inchi_key = AllChem.MolToInchiKey(mol)
+    mass = chemaxon.get_molecular_masses(molecules, 'mass_error')
+    cpd.mass = mass.iloc[0]['mass']
 
     # No magnesium data
     cpd.magnesium_dissociation_constants = []
@@ -147,16 +174,21 @@ def gen_compound(mol_string: str):
     # Decompose the compounds into the group vectors
     mol = molecule.Molecule.FromSmiles(major_ms)
     decomposition = group_decomposer.Decompose(mol, ignore_protonations=False, raise_exception=True)
-    cpd.group_vector = decomposition.AsVector()
+    cpd.group_vector = list(decomposition.AsVector())
       
     return cpd
+
 
 def save_ccache():
     ccache.session.commit()
 
+def close_session():
+    ccache.session.close()
+
 def _get_ccache():
     # Returns the ccache for direct use
     return ccache
+
 # End KMS Code
 ###############################################################################
 
@@ -253,26 +285,108 @@ def _get_microspecies_data(
         microspecies,
     )
 
+def _populate_microspecies(session, compound: Compound, mid_ph: float = 7.0) -> None:
+    """
+    Calculate dissociation constants and create microspecies for a single Compound.
 
-if __name__ == '__main__':
+    Parameters
+    ----------
+    session : sqlalchemy.orm.session.Session
+        An active session in order to communicate with a SQL database.
+    compound: Compound
+        The compound object to determine the microspecies.
+    mid_ph : float
+        The pH for which the major microspecies is calculated
+        (Default value = 7.0).
 
-    from component_contribution.predict import GibbsEnergyPredictor
-    GP = GibbsEnergyPredictor()
+    """
 
-    cond = {
-    'p_h': Q_(7),
-    'ionic_strength': Q_('0.1M'),
-    'temperature': Q_('298.15K'),
-    'p_mg': Q_(0)}
+    # We only create microspecies for compounds that have dissociation_constants
+    # (although it could also be an empty list) and an atom_bag (which we need
+    # in order to determine the nH and z of the major microspecies).
 
-    mol_smiles = 'CC1=CC(O)=CC(=O)O1'
-    cpd_get = get_compound(mol_smiles)
-    print('mol_smiles')
-    print(GP.standard_dgf(cpd_get))
-    print('\n')
+    microspecies_mappings = _create_microspecies_mappings(compound, mid_ph)
+    session.bulk_insert_mappings(CompoundMicrospecies, microspecies_mappings)
 
-    mol_smiles = 'OC(=O)CC(O)=O'
-    cpd_get = get_compound(mol_smiles)
-    print('mol_smiles')
-    print(GP.standard_dgf(cpd_get))
-    print('\n')
+
+def _create_microspecies_mappings(
+    compound: Compound, mid_ph: float = 7.0
+) -> List[dict]:
+    """Create the mappings for the microspecies of a Compound.
+
+    Parameters
+    ----------
+    compound : Compound
+        A Compound object, where the atom_bag and dissociation_constants must
+        not be None.
+    mid_ph : float
+        The pH for which the major microspecies is calculated
+        (Default value = 7.0).
+
+    Returns
+    -------
+    list
+        A list of mappings for creating the entries in the compound_microspecies
+        table.
+
+    """
+    # We add an exception for H+ (and put z = nH = 0) in order to
+    # eliminate its effect of the Legendre transform.
+    if compound.inchi_key == PROTON_INCHI_KEY:
+        return [
+            {
+                "compound_id": compound.id,
+                "charge": 0,
+                "number_protons": 0,
+                "number_magnesiums": 0,
+                "ddg_over_rt": 0.0,
+                "is_major": True,
+            }
+        ]
+
+    # Find the index of the major microspecies, by counting how many pKas there
+    # are in the range between the given pH and the maximum (typically, 7 - 14).
+    # Then make a list of the nH and charge values for all the microspecies
+    if not compound.dissociation_constants:
+        num_species = 1
+        major_ms_index = 0
+    else:
+        num_species = len(compound.dissociation_constants) + 1
+        major_ms_index = sum(
+            (1 for p_ka in compound.dissociation_constants if p_ka > mid_ph)
+        )
+
+    major_ms_num_protons = compound.atom_bag.get("H", 0)
+    major_ms_charge = compound.net_charge
+
+    microspecies_mappings = dict()
+    for i in range(num_species):
+        charge = i - major_ms_index + major_ms_charge
+        num_protons = i - major_ms_index + major_ms_num_protons
+
+        if i == major_ms_index:
+            ddg_over_rt = 0.0
+        elif i < major_ms_index:
+            ddg_over_rt = (
+                sum(compound.dissociation_constants[i:major_ms_index]) * LOG10
+            )
+        elif i > major_ms_index:
+            ddg_over_rt = (
+                -sum(compound.dissociation_constants[major_ms_index:i]) * LOG10
+            )
+        else:
+            raise IndexError("Major microspecies index mismatch.")
+
+        microspecies_mappings[(num_protons, 0)] = {
+            "compound_id": compound.id,
+            "charge": charge,
+            "number_protons": num_protons,
+            "number_magnesiums": 0,
+            "ddg_over_rt": ddg_over_rt,
+            "is_major": i == major_ms_index,
+        }
+
+    return sorted(
+        microspecies_mappings.values(),
+        key=lambda x: (x["number_magnesiums"], x["number_protons"]),
+    )

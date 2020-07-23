@@ -59,8 +59,8 @@ class FocalSet(set):
                 "You must supply a non-empty focal atom string. "
                 'You may use "None" or "All" in the obvious fashion.'
             )
-
-        self.focal_atoms_str = focal_atoms_str
+        
+        self.focal_atoms_str = focal_atoms_str            
         prepped_str = focal_atoms_str.strip().lower()
 
         if prepped_str == "all":
@@ -98,6 +98,7 @@ class Group(object):
         focal_set: FocalSet = None,
     ):
         """Create a Group object."""
+        
         self.name = name
         self.hydrogens = hydrogens
         self.charge = charge
@@ -432,7 +433,6 @@ class GroupsData(object):
                 raise GroupsDataError(
                     "Cannot parse SMARTS expression: %s" % row.SMARTS
                 )
-
             group = Group(
                 row.NAME,
                 hydrogens=row.PROTONS,
@@ -618,6 +618,5 @@ class GroupVector(list):
             )
             if count != 0
         }
-
 
 DEFAULT_GROUPS_DATA = GroupsData.FromQuilt()
