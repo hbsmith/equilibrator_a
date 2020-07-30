@@ -1,11 +1,13 @@
 # Ignore cache
 cache/
-cache/compounds.sqlite
-cache/README.md
 
+# Ignore tests for now
+tests/
 # ignore output logs
-foo.log
-mass_error.log
+*.log
 
 # pycache
 __pycache__/
+
+# certain ipynb
+./ccache_update_test.ipynb

@@ -3,48 +3,47 @@
 #   1. Code written by Kevin Shebek
 #   2. Code taken from eQulibrator
 
-from typing import Dict, List, Tuple, NamedTuple
-import numpy as np
-import pandas as pd
-from copy import copy
+from typing import Dict, List, Tuple, Optional
+
 from pathlib import Path
+import shutil
 import os
 
+import pandas as pd
+import numpy as np
 import quilt
 
+from equilibrator_cache.api import create_compound_cache_from_sqlite_file
 from equilibrator_cache import Compound, CompoundMicrospecies, Q_
 from equilibrator_cache.compound_cache import PROTON_INCHI_KEY
-from equilibrator_cache.api import create_compound_cache_from_sqlite_file
 from equilibrator_assets import chemaxon, thermodynamics
 
-# The following modules were added
-# from component_contribution/scripts/support
+# The following modules were added from component_contribution/scripts/support
 import group_decompose, molecule
 
-# ##TODO Use openbabel to reduce dependencies
+# TODO: Use openbabel to reduce dependencies
 from rdkit.Chem import AllChem
 
 LOG10 = np.log(10.0)
+CACHE_PATH = './cache'
+SQLITE_PATH = Path('./cache/compounds.sqlite')
+DEFAULT_QUILT_PKG = 'equilibrator/cache'
 
-# quilt_package = 'kevbot/cache_mod'
-# version = None
-
-group_decomposer = group_decompose.GroupDecomposer()
-
-# Path to sqlite databases
-# TODO: code that generates the data from elad's quilt if it doesn't exist
-sqlite_path = Path('./cache/compounds.sqlite')
-if not sqlite_path.is_file():
-    print('Local compounds.sqlite not found. Exporting from equilibrator/cache quilt package.')
+# Generate a compounds.sqlite file if it doesn't exist already
+if not SQLITE_PATH.is_file():
+    print('Local compounds.sqlite not found. Exporting from default equilibrator/cache quilt repo.')
+    print('If another quilt repo is to be used, run generate_new_ccache with specified repo.')
+    
     os.mkdir('./cache')
-    quilt.export('equilibrator/cache', './cache')
+    quilt.install(DEFAULT_QUILT_PKG, force=True)
+    quilt.export(DEFAULT_QUILT_PKG, './cache')
 
-ccache = create_compound_cache_from_sqlite_file(sqlite_path)
-
+ccache = create_compound_cache_from_sqlite_file(SQLITE_PATH)
+group_decomposer = group_decompose.GroupDecomposer()
 
 ###############################################################################
 # KMS Code
-def get_compound(mol_string: str, update_cache: bool = True):
+def get_compound(mol_string: str, update_cache: bool = True, auto_commit: bool = False):
     """
     Gets a compound object from the compound cache, or generates one if not found.
 
@@ -67,7 +66,6 @@ def get_compound(mol_string: str, update_cache: bool = True):
     cc_search = ccache.search_compound_by_inchi_key(inchi_key.split('-')[0])
 
     if cc_search:
-        print('found match')
         cpd = cc_search[0]
     else:
         cpd = _gen_compound(mol_string)
@@ -79,6 +77,9 @@ def get_compound(mol_string: str, update_cache: bool = True):
             # Flush executes the command queued up by session.add
             # however, this does not commit to the database, it is temporary.
             ccache.session.flush()
+
+            if auto_commit == True:
+                ccache.session.commit()
 
             # populate the microspecies and flush
             # _populate_microspecies(ccache.session, cpd)
@@ -128,30 +129,30 @@ def _gen_compound(mol_string: str):
     max_ph = 14
     compound_mappings = []
     for row in constants.itertuples(index=False):
-                    p_kas = [getattr(row, col) for col in pka_columns]
-                    p_kas = map(float, p_kas)
-                    p_kas = filter(lambda p_ka: min_ph < p_ka < max_ph, p_kas)
-                    dissociation_constants = sorted(p_kas, reverse=True)
+        p_kas = [getattr(row, col) for col in pka_columns]
+        p_kas = map(float, p_kas)
+        p_kas = filter(lambda p_ka: min_ph < p_ka < max_ph, p_kas)
+        dissociation_constants = sorted(p_kas, reverse=True)
 
-                    if pd.isnull(row.major_ms) or row.major_ms == "":
-                        compound_mappings.append(
-                            {
-                                # "id": row.id,
-                                "atom_bag": {},
-                                "smiles": None,
-                                "dissociation_constants": dissociation_constants,
-                            }
-                        )
-                    else:
-                        atom_bag = chemaxon.get_atom_bag("smi", row.major_ms)
-                        compound_mappings.append(
-                            {
-                                # "id": row.id,
-                                "atom_bag": atom_bag,
-                                "smiles": row.major_ms,
-                                "dissociation_constants": dissociation_constants,
-                            }
-                        ) 
+        if pd.isnull(row.major_ms) or row.major_ms == "":
+            compound_mappings.append(
+                {
+                    # "id": row.id,
+                    "atom_bag": {},
+                    "smiles": None,
+                    "dissociation_constants": dissociation_constants,
+                }
+            )
+        else:
+            atom_bag = chemaxon.get_atom_bag("smi", row.major_ms)
+            compound_mappings.append(
+                {
+                    # "id": row.id,
+                    "atom_bag": atom_bag,
+                    "smiles": row.major_ms,
+                    "dissociation_constants": dissociation_constants,
+                }
+            ) 
 
     # Generate a compound with the compound mappings dictionary
     cpd = Compound(**compound_mappings[0])    
@@ -161,8 +162,6 @@ def _gen_compound(mol_string: str):
     mol = AllChem.MolFromSmiles(major_ms)
     cpd.inchi = AllChem.MolToInchi(mol)
     cpd.inchi_key = AllChem.MolToInchiKey(mol)
-    mass = chemaxon.get_molecular_masses(molecules, 'mass_error')
-    cpd.mass = mass.iloc[0]['mass']
 
     # No magnesium data
     cpd.magnesium_dissociation_constants = []
@@ -178,15 +177,53 @@ def _gen_compound(mol_string: str):
       
     return cpd
 
+def generate_new_ccache(
+    package: str = DEFAULT_QUILT_PKG,
+    hash: Optional[str] = None,
+    tag: Optional[str] = None,
+    version: Optional[str] = None,
+    force: bool = True,
+    ):
+    """
+    Generate the new compound.sqlite from a specified quilt package
 
-def save_ccache():
-    ccache.session.commit()
+    Parameters
+    ----------
+    package : str, optional
+        The quilt package used to initialize the compound cache
+        (Default value = `equilibrator/cache`)
+    hash : str, optional
+        quilt hash (Default value = None)
+    version : str, optional
+        quilt version (Default value = None)
+    tag : str, optional
+        quilt tag (Default value = None)
+    force : bool, optional
+        Re-download the quilt data if a newer version exists
+        (Default value = `True`).
 
-def close_session():
-    ccache.session.close()
+    """
+
+    print(f"Attempting to install {package} from quilt.")
+    quilt.install(
+        package=package, hash=hash, tag=tag, version=version, force=force
+        )
+    print('Removing old cache and generate new one')
+    shutil.rmtree(CACHE_PATH, ignore_errors=True)
+    os.mkdir('./cache')
+    quilt.export(package, './cache')
+    ccache = create_compound_cache_from_sqlite_file(SQLITE_PATH)   
 
 def _get_ccache():
-    # Returns the ccache for direct use
+    """
+    Returns the ccache object for direct use. Use with caution if you aren't very familiar with how the
+    eQuilibrator sqlite database works!
+
+    Returns
+    ----------
+    ccache : equilibrator_cache.compound_cache.CompoundCache
+        The compound cache generated from compounds.sqlite
+    """
     return ccache
 
 # End KMS Code
@@ -390,3 +427,6 @@ def _create_microspecies_mappings(
         microspecies_mappings.values(),
         key=lambda x: (x["number_magnesiums"], x["number_protons"]),
     )
+
+# End Noor Code
+###############################################################################
