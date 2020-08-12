@@ -8,6 +8,7 @@ tests/
 
 # pycache
 __pycache__/
+.pyc
 
 # certain ipynb
 ./ccache_update_test.ipynb
